@@ -46,9 +46,12 @@ void compressShader(std::string_view const src, Flattener &f, const LineDictiona
     }
 
     f.writeUint32(static_cast<uint32_t>(src.size() + 1));
-    f.writeValuePlaceholder();
+    f.writeValuePlaceholder(); // Num Lines
+    f.writeValuePlaceholder(); // Base Stream Size
 
     size_t numLines = 0;
+    std::vector<uint8_t> base_stream;
+    std::vector<uint8_t> ext_stream;
 
     size_t cur = 0;
     size_t const len = src.length();
@@ -74,9 +77,29 @@ void compressShader(std::string_view const src, Flattener &f, const LineDictiona
 
         numLines += indices.size();
         for (auto const index : indices) {
-            f.writeUint16(static_cast<uint16_t>(index));
+            if (index < 240) {
+                base_stream.push_back(static_cast<uint8_t>(index));
+            } else if (index < 4080) {
+                uint16_t const rel = index - 240;
+                base_stream.push_back(static_cast<uint8_t>(240 + (rel >> 8)));
+                ext_stream.push_back(static_cast<uint8_t>(rel & 0xFF));
+            } else {
+                base_stream.push_back(255);
+                uint32_t const rel = index - 4080;
+                ext_stream.push_back(static_cast<uint8_t>(rel & 0xFF));
+                ext_stream.push_back(static_cast<uint8_t>((rel >> 8) & 0xFF));
+            }
         }
     }
+
+    // We emit the dual streams continuously natively into the C++ Flattener block.
+    // By decoupling the 2-byte components out of an interleaved stream, LZ77 dictionary
+    // boundaries aren't continually polluted by trailing offset bytes natively!
+    f.writeRaw(reinterpret_cast<const char*>(base_stream.data()), base_stream.size());
+    f.writeRaw(reinterpret_cast<const char*>(ext_stream.data()), ext_stream.size());
+
+    // F.writeValue resolves backwards matching the LIFO queue of Placeholders!
+    f.writeValue(base_stream.size());
     f.writeValue(numLines);
 }
 

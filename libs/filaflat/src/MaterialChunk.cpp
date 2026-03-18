@@ -15,29 +15,39 @@
  */
 
 #include <filaflat/MaterialChunk.h>
+
+#include "private/filament/Variant.h"
+
 #include <filaflat/ChunkContainer.h>
 
-#include <backend/DriverEnums.h>
+#include <filament/MaterialChunkType.h>
 
-#include <utils/Log.h>
+#include <utils/Invocable.h>
+#include <utils/debug.h>
+
+#include <vector>
+
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
 
 namespace filaflat {
 
 static inline uint32_t makeKey(
         MaterialChunk::ShaderModel shaderModel,
-        MaterialChunk::Variant variant,
+        MaterialChunk::Variant const variant,
         MaterialChunk::ShaderStage stage) noexcept {
     static_assert(sizeof(variant.key) * 8 <= 8);
     return (uint32_t(shaderModel) << 16) | (uint32_t(stage) << 8) | variant.key;
 }
 
-void MaterialChunk::decodeKey(uint32_t key,
-        MaterialChunk::ShaderModel* model,
-        MaterialChunk::Variant* variant,
-        MaterialChunk::ShaderStage* stage) {
-    variant->key = key & 0xff;
-    *model = MaterialChunk::ShaderModel((key >> 16) & 0xff);
-    *stage = MaterialChunk::ShaderStage((key >> 8) & 0xff);
+void MaterialChunk::decodeKey(uint32_t const key,
+        ShaderModel* outModel,
+        Variant* outVariant,
+        ShaderStage* outStage) {
+    outVariant->key = key & 0xff;
+    *outModel = ShaderModel((key >> 16) & 0xff);
+    *outStage = ShaderStage((key >> 8) & 0xff);
 }
 
 MaterialChunk::MaterialChunk(ChunkContainer const& container)
@@ -46,7 +56,7 @@ MaterialChunk::MaterialChunk(ChunkContainer const& container)
 
 MaterialChunk::~MaterialChunk() noexcept = default;
 
-bool MaterialChunk::initialize(filamat::ChunkType materialTag) {
+bool MaterialChunk::initialize(filamat::ChunkType const materialTag) {
 
     if (mBase != nullptr) {
         // initialize() should be called only once.
@@ -93,7 +103,7 @@ bool MaterialChunk::initialize(filamat::ChunkType materialTag) {
             return false;
         }
 
-        uint32_t key = makeKey(ShaderModel(model), variant, ShaderStage(stage));
+        uint32_t const key = makeKey(ShaderModel(model), variant, ShaderStage(stage));
         mOffsets[key] = offsetValue;
     }
     return true;
@@ -101,19 +111,19 @@ bool MaterialChunk::initialize(filamat::ChunkType materialTag) {
 
 bool MaterialChunk::getTextShader(Unflattener unflattener,
         BlobDictionary const& dictionary, ShaderContent& shaderContent,
-        ShaderModel shaderModel, Variant variant, ShaderStage shaderStage) const {
+        ShaderModel const shaderModel, Variant const variant, ShaderStage const shaderStage) const {
     if (mBase == nullptr) {
         return false;
     }
 
     // Jump and read
-    uint32_t key = makeKey(shaderModel, variant, shaderStage);
+    uint32_t const key = makeKey(shaderModel, variant, shaderStage);
     auto pos = mOffsets.find(key);
     if (pos == mOffsets.end()) {
         return false;
     }
 
-    size_t offset = pos->second;
+    size_t const offset = pos->second;
     if (offset == 0) {
         // This shader was not found.
         return false;
@@ -132,22 +142,51 @@ bool MaterialChunk::getTextShader(Unflattener unflattener,
         return false;
     }
 
+    // Read base stream length natively to initialize our independent extension Unflattener
+    uint32_t baseLength = 0;
+    if (!unflattener.read(&baseLength)) {
+        return false;
+    }
+
     shaderContent.reserve(shaderSize);
     shaderContent.resize(shaderSize);
     size_t cursor = 0;
 
-    // Read all lines.
-    for(int32_t i = 0 ; i < lineCount; i++) {
-        uint16_t lineIndex;
-        if (!unflattener.read(&lineIndex)) {
-            return false;
+    /*
+     * We stream out shader texts using a Multi-Base Variable-Length Dual-Stream architecture.
+     * High entropy base sequences natively precede predictable dynamic trailing bytes.
+     * By maintaining the streams synchronously detached, Zstd tracks purely monolithic blocks.
+     */
+    Unflattener extUnflattener(unflattener);
+    extUnflattener.setCursor(unflattener.getCursor() + baseLength);
+
+    for (size_t i = 0; i < lineCount; ++i) {
+        uint8_t b8;
+        if (!unflattener.read(&b8)) return false;
+
+        uint32_t lineIndex = 0;
+        if (b8 < 240) {
+            lineIndex = b8;
+        } else if (b8 < 255) {
+            uint8_t ext;
+            if (!extUnflattener.read(&ext)) return false;
+            lineIndex = 240 + (((b8 - 240) << 8) | ext);
+        } else {
+            uint8_t extb0, extb1;
+            if (!extUnflattener.read(&extb0) || !extUnflattener.read(&extb1)) return false;
+            lineIndex = 4080 + (extb0 | (extb1 << 8));
         }
+
         const auto& content = dictionary[lineIndex];
 
         // remove the terminating null character.
         memcpy(&shaderContent[cursor], content.data(), content.size() - 1);
         cursor += content.size() - 1;
     }
+
+    // Explicitly leapfrog the native stream reader past the isolated Extension stream
+    // to preserve unflatten sync consistency natively across chunks.
+    unflattener.setCursor(extUnflattener.getCursor());
 
     // Write the terminating null character.
     shaderContent[cursor++] = 0;
@@ -157,13 +196,14 @@ bool MaterialChunk::getTextShader(Unflattener unflattener,
 }
 
 bool MaterialChunk::getBinaryShader(BlobDictionary const& dictionary,
-        ShaderContent& shaderContent, ShaderModel shaderModel, filament::Variant variant, ShaderStage shaderStage) const {
+        ShaderContent& shaderContent, ShaderModel const shaderModel,
+        filament::Variant const variant, ShaderStage const shaderStage) const {
 
     if (mBase == nullptr) {
         return false;
     }
 
-    uint32_t key = makeKey(shaderModel, variant, shaderStage);
+    uint32_t const key = makeKey(shaderModel, variant, shaderStage);
     auto pos = mOffsets.find(key);
     if (pos == mOffsets.end()) {
         return false;
@@ -173,7 +213,7 @@ bool MaterialChunk::getBinaryShader(BlobDictionary const& dictionary,
     return true;
 }
 
-bool MaterialChunk::hasShader(ShaderModel model, Variant variant, ShaderStage stage) const noexcept {
+bool MaterialChunk::hasShader(ShaderModel const model, Variant const variant, ShaderStage const stage) const noexcept {
     if (mBase == nullptr) {
         return false;
     }
@@ -182,7 +222,7 @@ bool MaterialChunk::hasShader(ShaderModel model, Variant variant, ShaderStage st
 }
 
 bool MaterialChunk::getShader(ShaderContent& shaderContent, BlobDictionary const& dictionary,
-        ShaderModel shaderModel, filament::Variant variant, ShaderStage stage) const {
+        ShaderModel const shaderModel, filament::Variant const variant, ShaderStage const stage) const {
     switch (mMaterialTag) {
         case filamat::ChunkType::MaterialGlsl:
         case filamat::ChunkType::MaterialEssl1:
@@ -229,6 +269,60 @@ void MaterialChunk::visitShaders(
         unflattener.read(&offsetValue);
 
         visitor(ShaderModel(shaderModelValue), variant, ShaderStage(pipelineStageValue));
+    }
+}
+
+void MaterialChunk::getDictionaryOccurrences(std::vector<uint32_t>& outOccurrences) const {
+    if (mBase == nullptr || (
+        mMaterialTag != filamat::ChunkType::MaterialGlsl &&
+        mMaterialTag != filamat::ChunkType::MaterialEssl1 &&
+        mMaterialTag != filamat::ChunkType::MaterialWgsl &&
+        mMaterialTag != filamat::ChunkType::MaterialMetal)) {
+        return;
+    }
+
+    for (auto const& chunk : mOffsets) {
+        Unflattener unflattener(mBase + chunk.second, mContainer.getChunkRange(mMaterialTag).second);
+
+        uint32_t shaderSize = 0;
+        if (!unflattener.read(&shaderSize)) continue;
+
+        uint32_t lineCount = 0;
+        if (!unflattener.read(&lineCount)) continue;
+
+        uint32_t baseLength = 0;
+        if (!unflattener.read(&baseLength)) continue;
+
+        Unflattener extUnflattener(unflattener);
+        extUnflattener.setCursor(unflattener.getCursor() + baseLength);
+
+        for (size_t i = 0; i < lineCount; ++i) {
+            uint8_t b8;
+            if (!unflattener.read(&b8)) {
+                break;
+            }
+
+            uint32_t lineIndex = 0;
+            if (b8 < 240) {
+                lineIndex = b8;
+            } else if (b8 < 255) {
+                uint8_t ext;
+                if (!extUnflattener.read(&ext)) {
+                    break;
+                }
+                lineIndex = 240 + (((b8 - 240) << 8) | ext);
+            } else {
+                uint8_t extb0, extb1;
+                if (!extUnflattener.read(&extb0) || !extUnflattener.read(&extb1)) {
+                    break;
+                }
+                lineIndex = 4080 + (extb0 | (extb1 << 8));
+            }
+
+            if (lineIndex < outOccurrences.size()) {
+                outOccurrences[lineIndex]++;
+            }
+        }
     }
 }
 

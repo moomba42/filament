@@ -56,6 +56,9 @@ public:
 
     bool hasShader(ShaderModel model, Variant variant, ShaderStage stage) const noexcept;
 
+    // Populates a pre-sized vector (matching dictionary size) with the frequency of each index
+    void getDictionaryOccurrences(std::vector<uint32_t>& outOccurrences) const;
+
     // These methods are for debugging purposes only (matdbg)
     // @{
     static void decodeKey(uint32_t key,

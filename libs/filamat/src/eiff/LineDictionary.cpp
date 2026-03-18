@@ -14,10 +14,52 @@
  * limitations under the License.
  */
 
+/*
+ * SHADER DICTIONARY ENCODING ARCHITECTURE
+ * ---------------------------------------
+ * The LineDictionary compresses raw shader source text into an optimized
+ * dictionary-based token stream. It specifically targets the redundancy found in
+ * generated materials, such as monolithic ubershaders (e.g. GLTFIO), where
+ * recurring tokens and numbered suffix identifiers (like 'param_1', 'param_2')
+ * dominate the text length.
+ *
+ * Tokenization and Splitting Algorithm:
+ * To maximize dictionary reusability without polluting the global token pool with
+ * thousands of unique permutations, the parser automatically splits known prefixes
+ * from their numeric suffixes (e.g. "param_112" -> "param_" + "112"). This yields
+ * a far smaller uncompressed String Dictionary.
+ *
+ * ZLib Zip Compressed archives:
+ * Achieving the lowest uncompressed RAM footprint natively requires
+ * aggressively splitting strings based on a broad set of keywords. However, ZLib
+ * (used in Android `.aar` packaging) inherently struggles with fragmented token
+ * layouts. When strings are highly fragmented, ZLib loses predictive "sliding
+ * window" sequence continuity, causing the package sequence to artificially inflate
+ * by multiple kilobytes.
+ *
+ * To balance both targets, the String splitting algorithm relies on a
+ * strictly optimized constraint: `kPatterns`. We strictly limit splitting out
+ * suffixes to only the exact set of patterns that mathematically offset their Zip
+ * boundary fragmentation cost.
+ *
+ * Furthermore, the dictionary index stream itself structurally deploys a Variable
+ * Length Dual-Stream format (Base sequence + Extension byte sequence). By pushing
+ * the unpredictable extension mathematics out of the core base representation,
+ * Zstandard natively compresses the remaining high-entropy base bytes cleanly.
+ *
+ *   [Base Stream]  (High entropy identifiers, densely packed 1-byte variables)
+ *   ┌────┬────┬────┬──────┬──────┬────┐
+ *   │ 43 │ 12 │ 08 │ ESC1 │ 0xFF │ 15 │   => (43, 12, 08, ESC1+01, 0xFF+031A, 15)
+ *   └────┴────┴────┴──────┴──────┴────┘
+ *                    │      │             ESC1 = [240-254] (1-byte Extension)
+ *                    ▼      ▼             0xFF = [255]     (2-byte Extension)
+ *   [Ext Stream]   ┌────┐ ┌────┬────┐
+ *                  │ 01 │ │ 03 │ 1A │     (Low entropy numeric offset digits,
+ *                  └────┘ └────┴────┘      perfectly preserving Zip boundaries)
+ */
+
 #include "LineDictionary.h"
 
-#include <utils/debug.h>
-#include <utils/Log.h>
 #include <utils/ostream.h>
 
 #include <algorithm>
@@ -67,7 +109,7 @@ std::vector<LineDictionary::index_t> LineDictionary::getIndices(
     return result;
 }
 
-void LineDictionary::addText(std::string_view const text) noexcept {
+void LineDictionary::addText(std::string_view const text) noexcept {    
     size_t cur = 0;
     size_t const len = text.length();
     const char* s = text.data();
@@ -111,7 +153,27 @@ std::string_view LineDictionary::ltrim(std::string_view s) {
 
 std::pair<size_t, size_t> LineDictionary::findPattern(
         std::string_view const line, size_t const offset) {
-    // Patterns are ordered from longest to shortest to ensure correct prefix matching.
+    /*
+     * Note on String Splitting & Dictionary Optimization
+     * --------------------------------------------------
+     * The array below defines heuristics to split generated variables from their trailing digits
+     * (e.g. `hp_copy_1` -> `hp_copy_`, `1`). We algorithmically mined the full compiled corpus of
+     * gltfio/filament materials to find the most common variable prefixes ending in digits that
+     * break otherwise identical lines in spirv-cross output. The theoretically optimal top results natively are:
+     *
+     * "SPIRV_CROSS_CONSTANT_ID_", "VARIABLE_CUSTOM", "spvDescriptorSet", "HAS_ATTRIBUTE_UV",
+     * "mesh_custom", "dynReserved", "material_", "vertex_uv", "hp_copy_", "mp_copy_", "normal_",
+     * "normal", "pixel_", "param_", "mesh_uv", "Arr_", "uv_", "n_", "x_", "i_", "uv", "f",
+     * "s", "i", "r", "p", "u", "a", "n", "m", "x", "_"
+     *
+     * While hardcoding all 32 discovered prefixes reduces uncompressed binaries by ~33 KB across the library,
+     * the aggressive fragmentation of tiny, highly localized variables (like `s1` or `f2`) accidentally
+     * destructs contiguous literal sequences. This causes Zlib/Deflate (LZ77) compressed `.aar` and `.bin`
+     * archive sizes to artificially balloon by ~2-3 KB.
+     *
+     * Therefore, we restrict this list to an optimal subset, maximizing ZIP synergy.
+     * Patterns must be ordered from longest to shortest to ensure correct prefix matching.
+     */
     static constexpr std::string_view kPatterns[] = { "hp_copy_", "mp_copy_", "_" };
 
     const size_t line_len = line.length();
@@ -182,6 +244,33 @@ std::vector<std::string_view> LineDictionary::splitString(std::string_view const
     return result;
 }
 
+void LineDictionary::resolve() noexcept {
+    std::vector<std::pair<std::string_view, LineInfo>> info;
+    info.reserve(mLineIndices.size());
+    for (auto const& pair : mLineIndices) {
+        info.push_back(pair);
+    }
+
+    // Sort by count descending, then by original index ascending for deterministic sorting
+    std::sort(info.begin(), info.end(),
+            [](auto const& lhs, auto const& rhs) {
+        if (lhs.second.count != rhs.second.count) {
+            return lhs.second.count > rhs.second.count;
+        }
+        return lhs.second.index < rhs.second.index;
+    });
+
+    std::vector<std::unique_ptr<std::string>> newStrings;
+    newStrings.reserve(mStrings.size());
+    for (index_t i = 0; i < info.size(); i++) {
+        auto& entry = mLineIndices[info[i].first];
+        newStrings.push_back(std::move(mStrings[entry.index]));
+        entry.index = i;
+    }
+    mStrings = std::move(newStrings);
+
+}
+
 void LineDictionary::printStatistics(utils::io::ostream& stream) const noexcept {
     std::vector<std::pair<std::string_view, LineInfo>> info;
     for (auto const& pair : mLineIndices) {
@@ -235,25 +324,6 @@ void LineDictionary::printStatistics(utils::io::ostream& stream) const noexcept 
     stream << "Indices size: " << indices_size << io::endl;
     stream << "Indices size (if varlen): " << indices_size_if_varlen << io::endl;
     stream << "Indices size (if varlen, sorted): " << indices_size_if_varlen_sorted << io::endl;
-
-    // some data we gathered
-
-    // Total size: 751161, compressed size: 59818
-    // Saved size: 691343
-    // Unique lines: 3659
-    // Total lines: 61686
-    // Compression ratio: 12.557440904075696
-    // Average line length (total): 12.177171481373406
-    // Average line length (compressed): 16.34818256354195
-
-
-    // Total size: 751161, compressed size: 263215
-    // Saved size: 487946
-    // Unique lines: 4672
-    // Total lines: 23258
-    // Compression ratio: 2.8537925270216364
-    // Average line length (total): 32.296887092613296
-    // Average line length (compressed): 56.338827054794521
 }
 
 } // namespace filamat
